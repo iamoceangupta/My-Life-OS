@@ -1,0 +1,26 @@
+const { createClient } = require('@supabase/supabase-js');
+const ANON = require('fs').readFileSync('keys.txt','utf8').split('\n')[0];
+const URL = 'http://localhost:8000';
+const ok = (c, m) => { console.log((c ? 'PASS ' : 'FAIL ') + m); if (!c) process.exitCode = 1; };
+(async () => {
+  const mk = async (email) => { const c = createClient(URL, ANON, { auth: { persistSession: false } }); let r = await c.auth.signUp({ email, password: 'secret123' }); if (r.error) r = await c.auth.signInWithPassword({ email, password: 'secret123' }); return c; };
+  const a = await mk('rls-a@test.dev'), b = await mk('rls-b@test.dev');
+  const ua = (await a.auth.getUser()).data.user.id, ub = (await b.auth.getUser()).data.user.id;
+  let r = await a.from('records').upsert({ store: 'tasks', id: 't1', data: { title: 'A secret' }, updated_at: 100 }, { onConflict: 'user_id,store,id' }).select();
+  ok(!r.error && r.data[0].user_id === ua, 'A inserts own row; user_id defaults to auth.uid()');
+  r = await b.from('records').select('*'); ok(!r.error && r.data.length === 0, 'B cannot see A\'s rows');
+  r = await b.from('records').insert({ user_id: ua, store: 'tasks', id: 'evil', data: {}, updated_at: 1 }); ok(r.error && r.error.code === '42501', 'B cannot insert a row as A (RLS ' + (r.error && r.error.code) + ')');
+  r = await b.from('records').update({ data: { title: 'hacked' } }).eq('user_id', ua).select(); ok(!r.error && r.data.length === 0, 'B cannot update A\'s rows');
+  r = await b.from('records').delete().eq('user_id', ua).select(); ok(!r.error && r.data.length === 0, 'B cannot delete A\'s rows');
+  r = await a.from('records').upsert({ user_id: ua, store: 'tasks', id: 't1', data: { title: 'older' }, updated_at: 50 }, { onConflict: 'user_id,store,id' }).select();
+  ok(!r.error && r.data.length === 0, 'Server LWW: older updated_at upsert is skipped (no row returned)');
+  r = await a.from('records').select('data,updated_at,server_updated_at').eq('id', 't1').single();
+  ok(r.data.data.title === 'A secret' && r.data.updated_at === 100, 'Stored row unchanged after stale write');
+  const t0 = r.data.server_updated_at;
+  await new Promise(s => setTimeout(s, 20));
+  r = await a.from('records').upsert({ user_id: ua, store: 'tasks', id: 't1', data: { title: 'newer' }, updated_at: 200 }, { onConflict: 'user_id,store,id' }).select();
+  ok(r.data.length === 1 && Date.parse(r.data[0].server_updated_at) > Date.parse(t0), 'Newer write accepted and trigger bumps server_updated_at');
+  r = await a.from('records').update({ server_updated_at: '2000-01-01T00:00:00Z', updated_at: 300 }).eq('id', 't1').select();
+  ok(Date.parse(r.data[0].server_updated_at) > Date.parse('2020-01-01'), 'Client cannot backdate server_updated_at');
+  await a.from('records').delete().eq('user_id', ua);
+})();
